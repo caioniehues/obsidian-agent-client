@@ -82,6 +82,81 @@ export interface SlashCommand {
 }
 
 // ============================================================================
+// Session Mode
+// ============================================================================
+
+/**
+ * Represents a mode available in the current session.
+ *
+ * Modes define how the agent behaves and processes requests.
+ * For example, "build" mode for implementation tasks, "plan" mode for
+ * architecture and design discussions.
+ *
+ * Modes are advertised by the agent in the NewSessionResponse and can
+ * be changed during the session via the ACP protocol.
+ */
+export interface SessionMode {
+	/** Unique identifier for this mode (e.g., "build", "plan") */
+	id: string;
+
+	/** Human-readable name for display */
+	name: string;
+
+	/** Optional description of what this mode does */
+	description?: string;
+}
+
+/**
+ * State of available modes in a session.
+ *
+ * Contains both the list of available modes and the currently active mode.
+ * Updated via NewSessionResponse initially and current_mode_update notifications.
+ */
+export interface SessionModeState {
+	/** List of modes available in this session */
+	availableModes: SessionMode[];
+
+	/** ID of the currently active mode */
+	currentModeId: string;
+}
+
+// ============================================================================
+// Model (Experimental)
+// ============================================================================
+
+/**
+ * Represents an AI model available in a session.
+ *
+ * Models determine which AI model is used for responses.
+ * This is an experimental feature and may change.
+ */
+export interface SessionModel {
+	/** Unique identifier for this model (e.g., "claude-sonnet-4") */
+	modelId: string;
+
+	/** Human-readable name for display */
+	name: string;
+
+	/** Optional description of this model */
+	description?: string;
+}
+
+/**
+ * State of available models in a session.
+ *
+ * Contains both the list of available models and the currently active model.
+ * Updated via NewSessionResponse initially.
+ * Note: Unlike modes, there is no dedicated notification for model changes.
+ */
+export interface SessionModelState {
+	/** List of models available in this session */
+	availableModels: SessionModel[];
+
+	/** ID of the currently active model */
+	currentModelId: string;
+}
+
+// ============================================================================
 // Chat Session
 // ============================================================================
 
@@ -119,6 +194,20 @@ export interface ChatSession {
 	 * Updated dynamically via ACP's `available_commands_update` notification.
 	 */
 	availableCommands?: SlashCommand[];
+
+	/**
+	 * Mode state for this session.
+	 * Contains available modes and the currently active mode.
+	 * Updated via NewSessionResponse and `current_mode_update` notification.
+	 */
+	modes?: SessionModeState;
+
+	/**
+	 * Model state for this session (experimental).
+	 * Contains available models and the currently active model.
+	 * Updated via NewSessionResponse initially.
+	 */
+	models?: SessionModelState;
 
 	/** Timestamp when the session was created */
 	createdAt: Date;

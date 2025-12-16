@@ -7,6 +7,26 @@ If your plugin does not need CSS, delete this file.
 
 */
 
+/* ===== Settings Tab Documentation Link ===== */
+.agent-client-doc-link {
+	padding: 12px 16px;
+	margin-bottom: 16px;
+	background-color: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	font-size: 14px;
+	color: var(--text-muted);
+}
+
+.agent-client-doc-link a {
+	color: var(--text-accent);
+	text-decoration: none;
+}
+
+.agent-client-doc-link a:hover {
+	text-decoration: underline;
+}
+
 /* ===== Settings Tab Custom Agent Block ===== */
 .agent-client-custom-agent {
 	padding: 16px;
@@ -443,29 +463,33 @@ If your plugin does not need CSS, delete this file.
 /* Input area */
 .chat-input-container {
 	flex-shrink: 0;
+	position: relative;
 }
 
-.chat-input-wrapper {
-	position: relative;
+/* Input box - outer container with border and background */
+.chat-input-box {
+	display: flex;
+	flex-direction: column;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	background-color: var(--background-primary);
+	overflow: hidden;
+	transition: box-shadow 0.15s ease;
+}
+
+.chat-input-box:focus-within {
+	box-shadow: 0 0 0 1.5px var(--background-modifier-border);
 }
 
 /* Auto-mention inline display */
 .auto-mention-inline {
-	position: absolute;
-	top: 0;
-	left: 0;
-	right: 0;
-	pointer-events: none;
-	z-index: 1;
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
 	gap: 4px;
-	padding: 6px 12px 6px 12px;
-	border: 1px solid var(--background-modifier-border);
-	border-bottom-width: 1px;
+	padding: 6px 12px;
+	border-bottom: 1px solid var(--background-modifier-border);
 	background-color: var(--background-primary);
-	border-radius: 8px 8px 0 0;
 }
 
 .mention-badge {
@@ -530,13 +554,13 @@ If your plugin does not need CSS, delete this file.
 
 .chat-input-textarea {
 	width: 100%;
-	padding: 12px 40px 12px 12px;
-	border: 1px solid var(--background-modifier-border);
-	border-radius: 8px;
-	background-color: var(--background-primary);
+	padding: 12px;
+	border: none;
+	background-color: transparent;
 	color: var(--text-normal);
 	resize: none;
 	min-height: 80px;
+	max-height: 300px;
 	font-family: inherit;
 	font-size: var(--font-text-size);
 	line-height: var(--line-height-normal);
@@ -547,20 +571,19 @@ If your plugin does not need CSS, delete this file.
 	-ms-overflow-style: none;
 }
 
-.chat-input-textarea.has-auto-mention {
-	padding-top: calc(var(--font-text-size) * var(--line-height-normal) + 16px);
-	min-height: calc(
-		80px + var(--font-text-size) * var(--line-height-normal) + 16px
-	);
-}
-
 .chat-input-textarea::-webkit-scrollbar {
 	display: none;
 }
 
 .chat-input-textarea:hover {
-	border: 1px solid var(--background-modifier-border) !important;
-	background-color: var(--background-primary) !important;
+	border: none !important;
+	background-color: transparent !important;
+}
+
+.chat-input-textarea:focus {
+	border: none !important;
+	outline: none !important;
+	box-shadow: none !important;
 }
 
 /* Dynamic textarea height management */
@@ -575,8 +598,8 @@ If your plugin does not need CSS, delete this file.
 /* Textarea wrapper for hint overlay */
 .textarea-wrapper {
 	position: relative;
-	display: flex;
 	flex: 1;
+	min-height: 80px;
 }
 
 /* Hint overlay for slash commands */
@@ -589,9 +612,7 @@ If your plugin does not need CSS, delete this file.
 	bottom: 0;
 	pointer-events: none;
 	/* Match textarea properties exactly */
-	padding: 12px 40px 12px 12px;
-	border: 1px solid transparent;
-	border-radius: 8px;
+	padding: 12px;
 	box-sizing: border-box;
 	font-family: inherit;
 	font-size: var(--font-text-size);
@@ -602,11 +623,6 @@ If your plugin does not need CSS, delete this file.
 	overflow: hidden;
 }
 
-/* Adjust hint overlay padding when auto-mention is shown */
-.chat-input-textarea.has-auto-mention ~ .hint-overlay {
-	padding-top: calc(var(--font-text-size) * var(--line-height-normal) + 16px);
-}
-
 .hint-overlay .invisible {
 	visibility: hidden;
 }
@@ -615,11 +631,137 @@ If your plugin does not need CSS, delete this file.
 	color: var(--text-faint);
 }
 
+/* Input Actions Container */
+.chat-input-actions {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 8px;
+	padding: 4px 12px 8px 12px;
+}
+
+/* Mode Selector */
+.mode-selector {
+	display: inline-flex;
+	align-items: center;
+	padding: 0 4px;
+	border-radius: 4px;
+	cursor: pointer;
+	transition: background-color 0.1s ease;
+	height: 20px;
+	max-width: 120px;
+}
+
+.mode-selector:hover {
+	background-color: var(--background-modifier-hover);
+}
+
+.mode-selector-icon {
+	display: flex;
+	align-items: center;
+	pointer-events: none;
+	color: var(--text-faint);
+	margin-left: 2px;
+	order: 2;
+}
+
+.mode-selector-icon svg {
+	width: 12px;
+	height: 12px;
+}
+
+.mode-selector select.dropdown {
+	padding: 0 !important;
+	margin: 0 !important;
+	border: none !important;
+	border-radius: 0 !important;
+	background: none !important;
+	background-color: transparent !important;
+	background-image: none !important;
+	box-shadow: none !important;
+	color: var(--text-faint) !important;
+	font-size: 11px !important;
+	cursor: pointer !important;
+	outline: none !important;
+	appearance: none !important;
+	-webkit-appearance: none !important;
+	-moz-appearance: none !important;
+	order: 1;
+	max-width: 100px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.mode-selector select.dropdown:hover,
+.mode-selector select.dropdown:focus {
+	color: var(--text-faint) !important;
+	background-color: transparent !important;
+	box-shadow: none !important;
+}
+
+/* Model Selector (experimental) */
+.model-selector {
+	display: inline-flex;
+	align-items: center;
+	padding: 0 4px;
+	border-radius: 4px;
+	cursor: pointer;
+	transition: background-color 0.1s ease;
+	height: 20px;
+	max-width: 120px;
+}
+
+.model-selector:hover {
+	background-color: var(--background-modifier-hover);
+}
+
+.model-selector-icon {
+	display: flex;
+	align-items: center;
+	pointer-events: none;
+	color: var(--text-faint);
+	margin-left: 2px;
+	order: 2;
+}
+
+.model-selector-icon svg {
+	width: 12px;
+	height: 12px;
+}
+
+.model-selector select.dropdown {
+	padding: 0 !important;
+	margin: 0 !important;
+	border: none !important;
+	border-radius: 0 !important;
+	background: none !important;
+	background-color: transparent !important;
+	background-image: none !important;
+	box-shadow: none !important;
+	color: var(--text-faint) !important;
+	font-size: 11px !important;
+	cursor: pointer !important;
+	outline: none !important;
+	appearance: none !important;
+	-webkit-appearance: none !important;
+	-moz-appearance: none !important;
+	order: 1;
+	max-width: 100px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.model-selector select.dropdown:hover,
+.model-selector select.dropdown:focus {
+	color: var(--text-faint) !important;
+	background-color: transparent !important;
+	box-shadow: none !important;
+}
+
 /* Send button */
 .chat-send-button {
-	position: absolute;
-	right: 8px;
-	bottom: 8px;
 	width: 20px;
 	height: 20px;
 	padding: 0 !important;
@@ -702,6 +844,7 @@ If your plugin does not need CSS, delete this file.
 	bottom: 100%;
 	left: 0;
 	right: 0;
+	max-height: 250px;
 	background-color: var(--background-secondary);
 	border: 2px solid var(--background-modifier-border);
 	border-radius: 8px;

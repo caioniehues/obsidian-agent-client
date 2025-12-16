@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import type {
 	ChatSession,
 	SessionState,
@@ -93,6 +93,26 @@ export interface UseAgentSessionReturn {
 	 * Called by AcpAdapter when agent sends available_commands_update.
 	 */
 	updateAvailableCommands: (commands: SlashCommand[]) => void;
+
+	/**
+	 * Callback to update current mode.
+	 * Called by AcpAdapter when agent sends current_mode_update.
+	 */
+	updateCurrentMode: (modeId: string) => void;
+
+	/**
+	 * Set the session mode.
+	 * Sends a request to the agent to change the mode.
+	 * @param modeId - ID of the mode to set
+	 */
+	setMode: (modeId: string) => Promise<void>;
+
+	/**
+	 * Set the session model (experimental).
+	 * Sends a request to the agent to change the model.
+	 * @param modelId - ID of the model to set
+	 */
+	setModel: (modelId: string) => Promise<void>;
 }
 
 // ============================================================================
@@ -239,6 +259,8 @@ function createInitialSession(
 		agentDisplayName,
 		authMethods: [],
 		availableCommands: undefined,
+		modes: undefined,
+		models: undefined,
 		createdAt: new Date(),
 		lastActivityAt: new Date(),
 		workingDirectory,
@@ -303,6 +325,8 @@ export function useAgentSession(
 			agentDisplayName: currentAgent.displayName,
 			authMethods: [],
 			availableCommands: undefined,
+			modes: undefined,
+			models: undefined,
 			createdAt: new Date(),
 			lastActivityAt: new Date(),
 		}));
@@ -355,6 +379,8 @@ export function useAgentSession(
 				sessionId: sessionResult.sessionId,
 				state: "ready",
 				authMethods: authMethods,
+				modes: sessionResult.modes,
+				models: sessionResult.models,
 				lastActivityAt: new Date(),
 			}));
 		} catch (error) {
@@ -445,11 +471,13 @@ export function useAgentSession(
 			await settingsAccess.updateSettings({ activeAgentId: agentId });
 
 			// Update session with new agent ID
-			// Clear availableCommands (new agent will send its own)
+			// Clear availableCommands, modes, and models (new agent will send its own)
 			setSession((prev) => ({
 				...prev,
 				agentId,
 				availableCommands: undefined,
+				modes: undefined,
+				models: undefined,
 			}));
 		},
 		[settingsAccess],
@@ -474,6 +502,139 @@ export function useAgentSession(
 		}));
 	}, []);
 
+	/**
+	 * Update current mode.
+	 * Called by AcpAdapter when receiving current_mode_update.
+	 */
+	const updateCurrentMode = useCallback((modeId: string) => {
+		setSession((prev) => {
+			// Only update if modes exist
+			if (!prev.modes) {
+				return prev;
+			}
+			return {
+				...prev,
+				modes: {
+					...prev.modes,
+					currentModeId: modeId,
+				},
+			};
+		});
+	}, []);
+
+	/**
+	 * Set the session mode.
+	 * Sends a request to the agent to change the mode.
+	 */
+	const setMode = useCallback(
+		async (modeId: string) => {
+			if (!session.sessionId) {
+				console.warn("Cannot set mode: no active session");
+				return;
+			}
+
+			// Store previous mode for rollback on error
+			const previousModeId = session.modes?.currentModeId;
+
+			// Optimistic update - update UI immediately
+			setSession((prev) => {
+				if (!prev.modes) return prev;
+				return {
+					...prev,
+					modes: {
+						...prev.modes,
+						currentModeId: modeId,
+					},
+				};
+			});
+
+			try {
+				await agentClient.setSessionMode(session.sessionId, modeId);
+				// Per ACP protocol, current_mode_update is only sent when the agent
+				// changes its own mode, not in response to client's setSessionMode.
+				// UI is already updated optimistically above.
+			} catch (error) {
+				console.error("Failed to set mode:", error);
+				// Rollback to previous mode on error
+				if (previousModeId) {
+					setSession((prev) => {
+						if (!prev.modes) return prev;
+						return {
+							...prev,
+							modes: {
+								...prev.modes,
+								currentModeId: previousModeId,
+							},
+						};
+					});
+				}
+			}
+		},
+		[agentClient, session.sessionId, session.modes?.currentModeId],
+	);
+
+	/**
+	 * Set the session model (experimental).
+	 * Sends a request to the agent to change the model.
+	 */
+	const setModel = useCallback(
+		async (modelId: string) => {
+			if (!session.sessionId) {
+				console.warn("Cannot set model: no active session");
+				return;
+			}
+
+			// Store previous model for rollback on error
+			const previousModelId = session.models?.currentModelId;
+
+			// Optimistic update - update UI immediately
+			setSession((prev) => {
+				if (!prev.models) return prev;
+				return {
+					...prev,
+					models: {
+						...prev.models,
+						currentModelId: modelId,
+					},
+				};
+			});
+
+			try {
+				await agentClient.setSessionModel(session.sessionId, modelId);
+				// Note: Unlike modes, there is no dedicated notification for model changes.
+				// UI is already updated optimistically above.
+			} catch (error) {
+				console.error("Failed to set model:", error);
+				// Rollback to previous model on error
+				if (previousModelId) {
+					setSession((prev) => {
+						if (!prev.models) return prev;
+						return {
+							...prev,
+							models: {
+								...prev.models,
+								currentModelId: previousModelId,
+							},
+						};
+					});
+				}
+			}
+		},
+		[agentClient, session.sessionId, session.models?.currentModelId],
+	);
+
+	// Register error callback for process-level errors
+	useEffect(() => {
+		agentClient.onError((error) => {
+			setSession((prev) => ({ ...prev, state: "error" }));
+			setErrorInfo({
+				title: error.title || "Agent Error",
+				message: error.message || "An error occurred",
+				suggestion: error.suggestion,
+			});
+		});
+	}, [agentClient]);
+
 	return {
 		session,
 		isReady,
@@ -485,5 +646,8 @@ export function useAgentSession(
 		switchAgent,
 		getAvailableAgents,
 		updateAvailableCommands,
+		updateCurrentMode,
+		setMode,
+		setModel,
 	};
 }

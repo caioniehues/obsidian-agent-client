@@ -1,11 +1,15 @@
 import * as React from "react";
 const { useRef, useState, useEffect, useCallback, useMemo } = React;
-import { setIcon } from "obsidian";
+import { setIcon, DropdownComponent } from "obsidian";
 
 import type AgentClientPlugin from "../../plugin";
 import type { ChatView } from "./ChatView";
 import type { NoteMetadata } from "../../domain/ports/vault-access.port";
-import type { SlashCommand } from "../../domain/models/chat-session";
+import type {
+	SlashCommand,
+	SessionModeState,
+	SessionModelState,
+} from "../../domain/models/chat-session";
 import type { UseMentionsReturn } from "../../hooks/useMentions";
 import type { UseSlashCommandsReturn } from "../../hooks/useSlashCommands";
 import type { UseAutoMentionReturn } from "../../hooks/useAutoMention";
@@ -44,6 +48,14 @@ export interface ChatInputProps {
 	onStopGeneration: () => Promise<void>;
 	/** Callback when restored message has been consumed */
 	onRestoredMessageConsumed: () => void;
+	/** Session mode state (available modes and current mode) */
+	modes?: SessionModeState;
+	/** Callback when mode is changed */
+	onModeChange?: (modeId: string) => void;
+	/** Session model state (available models and current model) - experimental */
+	models?: SessionModelState;
+	/** Callback when model is changed */
+	onModelChange?: (modelId: string) => void;
 }
 
 /**
@@ -73,6 +85,10 @@ export function ChatInput({
 	onSendMessage,
 	onStopGeneration,
 	onRestoredMessageConsumed,
+	modes,
+	onModeChange,
+	models,
+	onModelChange,
 }: ChatInputProps) {
 	const logger = useMemo(() => new Logger(plugin), [plugin]);
 
@@ -84,6 +100,10 @@ export function ChatInput({
 	// Refs
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	const sendButtonRef = useRef<HTMLButtonElement>(null);
+	const modeDropdownRef = useRef<HTMLDivElement>(null);
+	const modeDropdownInstance = useRef<DropdownComponent | null>(null);
+	const modelDropdownRef = useRef<HTMLDivElement>(null);
+	const modelDropdownInstance = useRef<DropdownComponent | null>(null);
 
 	/**
 	 * Common logic for setting cursor position after text replacement.
@@ -164,12 +184,10 @@ export function ChatInput({
 			// Temporarily use auto to measure
 			textarea.classList.add("textarea-auto-height");
 			const scrollHeight = textarea.scrollHeight;
+			const minHeight = 80;
 			const maxHeight = 300;
-			const hasAutoMention =
-				textarea.classList.contains("has-auto-mention");
-			const minHeight = hasAutoMention ? 116 : 80;
 
-			// Check if expansion is needed
+			// Calculate height
 			const calculatedHeight = Math.max(
 				minHeight,
 				Math.min(scrollHeight, maxHeight),
@@ -410,20 +428,147 @@ export function ChatInput({
 	}, []);
 
 	// Restore message when provided (e.g., after cancellation)
+	// Only restore if input is empty to avoid overwriting user's new input
 	useEffect(() => {
 		if (restoredMessage) {
-			setInputValue(restoredMessage);
+			if (!inputValue.trim()) {
+				setInputValue(restoredMessage);
+				// Focus and place cursor at end
+				window.setTimeout(() => {
+					if (textareaRef.current) {
+						textareaRef.current.focus();
+						textareaRef.current.selectionStart =
+							restoredMessage.length;
+						textareaRef.current.selectionEnd =
+							restoredMessage.length;
+					}
+				}, 0);
+			}
 			onRestoredMessageConsumed();
-			// Focus and place cursor at end
-			window.setTimeout(() => {
-				if (textareaRef.current) {
-					textareaRef.current.focus();
-					textareaRef.current.selectionStart = restoredMessage.length;
-					textareaRef.current.selectionEnd = restoredMessage.length;
-				}
-			}, 0);
 		}
-	}, [restoredMessage, onRestoredMessageConsumed]);
+	}, [restoredMessage, onRestoredMessageConsumed, inputValue]);
+
+	// Stable references for callbacks
+	const onModeChangeRef = useRef(onModeChange);
+	onModeChangeRef.current = onModeChange;
+
+	// Initialize Mode dropdown (only when availableModes change)
+	const availableModes = modes?.availableModes;
+	const currentModeId = modes?.currentModeId;
+
+	useEffect(() => {
+		const containerEl = modeDropdownRef.current;
+		if (!containerEl) return;
+
+		// Only show dropdown if there are multiple modes
+		if (!availableModes || availableModes.length <= 1) {
+			// Clean up existing dropdown if modes become unavailable
+			if (modeDropdownInstance.current) {
+				containerEl.empty();
+				modeDropdownInstance.current = null;
+			}
+			return;
+		}
+
+		// Create dropdown if not exists
+		if (!modeDropdownInstance.current) {
+			const dropdown = new DropdownComponent(containerEl);
+			modeDropdownInstance.current = dropdown;
+
+			// Add options
+			for (const mode of availableModes) {
+				dropdown.addOption(mode.id, mode.name);
+			}
+
+			// Set initial value
+			if (currentModeId) {
+				dropdown.setValue(currentModeId);
+			}
+
+			// Handle change - use ref to avoid recreating dropdown on callback change
+			dropdown.onChange((value) => {
+				if (onModeChangeRef.current) {
+					onModeChangeRef.current(value);
+				}
+			});
+		}
+
+		// Cleanup on unmount or when availableModes change
+		return () => {
+			if (modeDropdownInstance.current) {
+				containerEl.empty();
+				modeDropdownInstance.current = null;
+			}
+		};
+	}, [availableModes]);
+
+	// Update dropdown value when currentModeId changes (separate effect)
+	useEffect(() => {
+		if (modeDropdownInstance.current && currentModeId) {
+			modeDropdownInstance.current.setValue(currentModeId);
+		}
+	}, [currentModeId]);
+
+	// Stable references for model callbacks
+	const onModelChangeRef = useRef(onModelChange);
+	onModelChangeRef.current = onModelChange;
+
+	// Initialize Model dropdown (only when availableModels change)
+	const availableModels = models?.availableModels;
+	const currentModelId = models?.currentModelId;
+
+	useEffect(() => {
+		const containerEl = modelDropdownRef.current;
+		if (!containerEl) return;
+
+		// Only show dropdown if there are multiple models
+		if (!availableModels || availableModels.length <= 1) {
+			// Clean up existing dropdown if models become unavailable
+			if (modelDropdownInstance.current) {
+				containerEl.empty();
+				modelDropdownInstance.current = null;
+			}
+			return;
+		}
+
+		// Create dropdown if not exists
+		if (!modelDropdownInstance.current) {
+			const dropdown = new DropdownComponent(containerEl);
+			modelDropdownInstance.current = dropdown;
+
+			// Add options
+			for (const model of availableModels) {
+				dropdown.addOption(model.modelId, model.name);
+			}
+
+			// Set initial value
+			if (currentModelId) {
+				dropdown.setValue(currentModelId);
+			}
+
+			// Handle change - use ref to avoid recreating dropdown on callback change
+			dropdown.onChange((value) => {
+				if (onModelChangeRef.current) {
+					onModelChangeRef.current(value);
+				}
+			});
+		}
+
+		// Cleanup on unmount or when availableModels change
+		return () => {
+			if (modelDropdownInstance.current) {
+				containerEl.empty();
+				modelDropdownInstance.current = null;
+			}
+		};
+	}, [availableModels]);
+
+	// Update dropdown value when currentModelId changes (separate effect)
+	useEffect(() => {
+		if (modelDropdownInstance.current && currentModelId) {
+			modelDropdownInstance.current.setValue(currentModelId);
+		}
+	}, [currentModelId]);
 
 	// Button disabled state
 	const isButtonDisabled =
@@ -434,41 +579,34 @@ export function ChatInput({
 
 	return (
 		<div className="chat-input-container">
-			<div className="chat-input-wrapper">
-				{/* Mention Dropdown */}
-				{(() => {
-					logger.log("[DEBUG] Dropdown render check:", {
-						isOpen: mentions.isOpen,
-						suggestionsCount: mentions.suggestions.length,
-						selectedIndex: mentions.selectedIndex,
-					});
-					return null;
-				})()}
-				{mentions.isOpen && (
-					<SuggestionDropdown
-						type="mention"
-						items={mentions.suggestions}
-						selectedIndex={mentions.selectedIndex}
-						onSelect={selectMention}
-						onClose={mentions.close}
-						plugin={plugin}
-						view={view}
-					/>
-				)}
+			{/* Mention Dropdown */}
+			{mentions.isOpen && (
+				<SuggestionDropdown
+					type="mention"
+					items={mentions.suggestions}
+					selectedIndex={mentions.selectedIndex}
+					onSelect={selectMention}
+					onClose={mentions.close}
+					plugin={plugin}
+					view={view}
+				/>
+			)}
 
-				{/* Slash Command Dropdown */}
-				{slashCommands.isOpen && (
-					<SuggestionDropdown
-						type="slash-command"
-						items={slashCommands.suggestions}
-						selectedIndex={slashCommands.selectedIndex}
-						onSelect={handleSelectSlashCommand}
-						onClose={slashCommands.close}
-						plugin={plugin}
-						view={view}
-					/>
-				)}
+			{/* Slash Command Dropdown */}
+			{slashCommands.isOpen && (
+				<SuggestionDropdown
+					type="slash-command"
+					items={slashCommands.suggestions}
+					selectedIndex={slashCommands.selectedIndex}
+					onSelect={handleSelectSlashCommand}
+					onClose={slashCommands.close}
+					plugin={plugin}
+					view={view}
+				/>
+			)}
 
+			{/* Input Box - flexbox container with border */}
+			<div className="chat-input-box">
 				{/* Auto-mention Badge */}
 				{autoMentionEnabled && autoMention.activeNote && (
 					<div className="auto-mention-inline">
@@ -534,20 +672,63 @@ export function ChatInput({
 					)}
 				</div>
 
-				{/* Send/Stop Button */}
-				<button
-					ref={sendButtonRef}
-					onClick={() => void handleSendOrStop()}
-					disabled={isButtonDisabled}
-					className={`chat-send-button ${isSending ? "sending" : ""} ${isButtonDisabled ? "disabled" : ""}`}
-					title={
-						!isSessionReady
-							? "Connecting..."
-							: isSending
-								? "Stop generation"
-								: "Send message"
-					}
-				></button>
+				{/* Input Actions (Mode Selector + Model Selector + Send Button) */}
+				<div className="chat-input-actions">
+					{/* Mode Selector */}
+					{modes && modes.availableModes.length > 1 && (
+						<div
+							ref={modeDropdownRef}
+							className="mode-selector"
+							title={
+								modes.availableModes.find(
+									(m) => m.id === modes.currentModeId,
+								)?.description ?? "Select mode"
+							}
+						>
+							<span
+								className="mode-selector-icon"
+								ref={(el) => {
+									if (el) setIcon(el, "chevron-down");
+								}}
+							/>
+						</div>
+					)}
+
+					{/* Model Selector (experimental) */}
+					{models && models.availableModels.length > 1 && (
+						<div
+							ref={modelDropdownRef}
+							className="model-selector"
+							title={
+								models.availableModels.find(
+									(m) => m.modelId === models.currentModelId,
+								)?.description ?? "Select model"
+							}
+						>
+							<span
+								className="model-selector-icon"
+								ref={(el) => {
+									if (el) setIcon(el, "chevron-down");
+								}}
+							/>
+						</div>
+					)}
+
+					{/* Send/Stop Button */}
+					<button
+						ref={sendButtonRef}
+						onClick={() => void handleSendOrStop()}
+						disabled={isButtonDisabled}
+						className={`chat-send-button ${isSending ? "sending" : ""} ${isButtonDisabled ? "disabled" : ""}`}
+						title={
+							!isSessionReady
+								? "Connecting..."
+								: isSending
+									? "Stop generation"
+									: "Send message"
+						}
+					></button>
+				</div>
 			</div>
 		</div>
 	);

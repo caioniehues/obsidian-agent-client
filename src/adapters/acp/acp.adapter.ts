@@ -7,19 +7,22 @@ import type {
 	AgentConfig,
 	InitializeResult,
 	NewSessionResult,
-	PermissionRequest,
 } from "../../domain/ports/agent-client.port";
 import type {
-	ChatMessage,
 	MessageContent,
 	PermissionOption,
 } from "../../domain/models/chat-message";
+import type { SessionUpdate } from "../../domain/models/session-update";
 import type { AgentError } from "../../domain/models/agent-error";
 import { AcpTypeConverter } from "./acp-type-converter";
 import { TerminalManager } from "../../shared/terminal-manager";
 import { Logger } from "../../shared/logger";
 import type AgentClientPlugin from "../../plugin";
-import type { SlashCommand } from "src/domain/models/chat-session";
+import type {
+	SlashCommand,
+	SessionModeState,
+	SessionModelState,
+} from "src/domain/models/chat-session";
 import {
 	wrapCommandForWsl,
 	convertWindowsPathToWsl,
@@ -63,22 +66,18 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 	private agentProcess: ChildProcess | null = null;
 	private logger: Logger;
 
-	// Callback handlers
-	private messageCallback: ((message: ChatMessage) => void) | null = null;
-	private errorCallback: ((error: AgentError) => void) | null = null;
-	private permissionCallback: ((request: PermissionRequest) => void) | null =
+	// Session update callback (unified callback for all session updates)
+	private sessionUpdateCallback: ((update: SessionUpdate) => void) | null =
 		null;
-	private updateAvailableCommandsCallback:
-		| ((commands: SlashCommand[]) => void)
-		| null = null;
 
-	// Message update callbacks (for ViewModel integration)
-	private addMessage: (message: ChatMessage) => void;
-	private updateLastMessage: (content: MessageContent) => void;
+	// Error callback for process-level errors
+	private errorCallback: ((error: AgentError) => void) | null = null;
+
+	// Message update callback for permission UI updates
 	private updateMessage: (
 		toolCallId: string,
 		content: MessageContent,
-	) => boolean;
+	) => void;
 
 	// Configuration state
 	private currentConfig: AgentConfig | null = null;
@@ -103,46 +102,27 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 		options: PermissionOption[];
 	}> = [];
 
-	constructor(
-		private plugin: AgentClientPlugin,
-		addMessage?: (message: ChatMessage) => void,
-		updateLastMessage?: (content: MessageContent) => void,
-		updateMessage?: (
-			toolCallId: string,
-			content: MessageContent,
-		) => boolean,
-	) {
+	constructor(private plugin: AgentClientPlugin) {
 		this.logger = new Logger(plugin);
-		// Initialize with provided callbacks or no-ops
-		this.addMessage = addMessage || (() => {});
-		this.updateLastMessage = updateLastMessage || (() => {});
-		this.updateMessage = updateMessage || (() => false);
+		// Initialize with no-op callback
+		this.updateMessage = () => {};
 
 		// Initialize TerminalManager
 		this.terminalManager = new TerminalManager(plugin);
 	}
 
 	/**
-	 * Set message callbacks after construction.
+	 * Set the update message callback for permission UI updates.
 	 *
-	 * This allows decoupling AcpAdapter creation from ViewModel creation,
-	 * enabling proper dependency injection in Clean Architecture.
+	 * This callback is used to update tool call messages when permission
+	 * requests are responded to or cancelled.
 	 *
-	 * @param addMessage - Callback to add a new message to chat
-	 * @param updateLastMessage - Callback to update the last message
 	 * @param updateMessage - Callback to update a specific message by toolCallId
-	 * @param updateAvailableCommandsCallback - Callback to update available commands
 	 */
-	setMessageCallbacks(
-		addMessage: (message: ChatMessage) => void,
-		updateLastMessage: (content: MessageContent) => void,
-		updateMessage: (toolCallId: string, content: MessageContent) => boolean,
-		updateAvailableCommandsCallback: (commands: SlashCommand[]) => void,
+	setUpdateMessageCallback(
+		updateMessage: (toolCallId: string, content: MessageContent) => void,
 	): void {
-		this.addMessage = addMessage;
-		this.updateLastMessage = updateLastMessage;
 		this.updateMessage = updateMessage;
-		this.updateAvailableCommandsCallback = updateAvailableCommandsCallback;
 	}
 
 	/**
@@ -180,18 +160,9 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 
 		// Validate command
 		if (!config.command || config.command.trim().length === 0) {
-			const error: AgentError = {
-				id: crypto.randomUUID(),
-				category: "configuration",
-				severity: "error",
-				title: "Command Not Configured",
-				message: `Command not configured for agent "${config.displayName}" (${config.id}).`,
-				suggestion: "Please configure the agent command in settings.",
-				occurredAt: new Date(),
-				agentId: config.id,
-			};
-			this.errorCallback?.(error);
-			throw new Error(error.message);
+			throw new Error(
+				`Command not configured for agent "${config.displayName}" (${config.id}). Please configure the agent command in settings.`,
+			);
 		}
 
 		const command = config.command.trim();
@@ -270,13 +241,35 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 			const commandString = [command, ...args]
 				.map((arg) => "'" + arg.replace(/'/g, "'\\''") + "'")
 				.join(" ");
+
+			// If nodePath is configured, prepend PATH export to ensure node is available.
+			// This is necessary because:
+			// 1. Login shells (-l) re-initialize PATH from shell config files, overwriting env.PATH
+			// 2. Even when the agent command uses an absolute path, scripts with shebang
+			//    "#!/usr/bin/env node" require node to be in PATH for the env command to find it
+			// Therefore, we must explicitly set PATH inside the shell command
+			let fullCommand = commandString;
+			if (
+				this.plugin.settings.nodePath &&
+				this.plugin.settings.nodePath.trim().length > 0
+			) {
+				const nodeDir = resolveCommandDirectory(
+					this.plugin.settings.nodePath.trim(),
+				);
+				if (nodeDir) {
+					// Escape single quotes in nodeDir for shell safety
+					const escapedNodeDir = nodeDir.replace(/'/g, "'\\''");
+					fullCommand = `export PATH='${escapedNodeDir}':"$PATH"; ${commandString}`;
+				}
+			}
+
 			spawnCommand = shell;
-			spawnArgs = ["-l", "-c", commandString];
+			spawnArgs = ["-l", "-c", fullCommand];
 			this.logger.log(
 				"[AcpAdapter] Using login shell:",
 				shell,
 				"with command:",
-				commandString,
+				fullCommand,
 			);
 		}
 
@@ -334,7 +327,7 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 			if (code === 127) {
 				this.logger.error(`[AcpAdapter] Command not found: ${command}`);
 
-				const error: AgentError = {
+				const agentError: AgentError = {
 					id: crypto.randomUUID(),
 					category: "configuration",
 					severity: "error",
@@ -346,7 +339,7 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 					code: code,
 				};
 
-				this.errorCallback?.(error);
+				this.errorCallback?.(agentError);
 			}
 		});
 
@@ -437,20 +430,6 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 			this.isInitializedFlag = false;
 			this.currentAgentId = null;
 
-			const agentError: AgentError = {
-				id: crypto.randomUUID(),
-				category: "connection",
-				severity: "error",
-				title: "Initialization Failed",
-				message: `Failed to initialize connection to ${agentLabel}: ${error instanceof Error ? error.message : String(error)}`,
-				suggestion:
-					"Please check the agent configuration and try again.",
-				occurredAt: new Date(),
-				agentId: config.id,
-				originalError: error,
-			};
-
-			this.errorCallback?.(agentError);
 			throw error;
 		}
 	}
@@ -487,27 +466,57 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 			this.logger.log(
 				`[AcpAdapter] 📝 Created session: ${sessionResult.sessionId}`,
 			);
+			this.logger.log(
+				"[AcpAdapter] NewSessionResponse:",
+				JSON.stringify(sessionResult, null, 2),
+			);
+
+			// Convert modes from ACP format to domain format
+			let modes: SessionModeState | undefined;
+			if (sessionResult.modes) {
+				modes = {
+					availableModes: sessionResult.modes.availableModes.map(
+						(m) => ({
+							id: m.id,
+							name: m.name,
+							// Convert null to undefined for type compatibility
+							description: m.description ?? undefined,
+						}),
+					),
+					currentModeId: sessionResult.modes.currentModeId,
+				};
+				this.logger.log(
+					`[AcpAdapter] Session modes: ${modes.availableModes.map((m) => m.id).join(", ")} (current: ${modes.currentModeId})`,
+				);
+			}
+
+			// Convert models from ACP format to domain format (experimental)
+			let models: SessionModelState | undefined;
+			if (sessionResult.models) {
+				models = {
+					availableModels: sessionResult.models.availableModels.map(
+						(m) => ({
+							modelId: m.modelId,
+							name: m.name,
+							// Convert null to undefined for type compatibility
+							description: m.description ?? undefined,
+						}),
+					),
+					currentModelId: sessionResult.models.currentModelId,
+				};
+				this.logger.log(
+					`[AcpAdapter] Session models: ${models.availableModels.map((m) => m.modelId).join(", ")} (current: ${models.currentModelId})`,
+				);
+			}
 
 			return {
 				sessionId: sessionResult.sessionId,
+				modes,
+				models,
 			};
 		} catch (error) {
 			this.logger.error("[AcpAdapter] New Session Error:", error);
 
-			const agentError: AgentError = {
-				id: crypto.randomUUID(),
-				category: "connection",
-				severity: "error",
-				title: "Session Creation Failed",
-				message: `Failed to create new session: ${error instanceof Error ? error.message : String(error)}`,
-				suggestion:
-					"Please try disconnecting and reconnecting to the agent.",
-				occurredAt: new Date(),
-				agentId: this.currentConfig?.id,
-				originalError: error,
-			};
-
-			this.errorCallback?.(agentError);
 			throw error;
 		}
 	}
@@ -528,56 +537,6 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 			return true;
 		} catch (error: unknown) {
 			this.logger.error("[AcpAdapter] Authentication Error:", error);
-
-			// Check if this is a rate limit error
-			const errorObj = error as Record<string, unknown> | null;
-			const isRateLimitError =
-				errorObj &&
-				typeof errorObj === "object" &&
-				"code" in errorObj &&
-				errorObj.code === 429;
-
-			let agentError: AgentError;
-
-			if (isRateLimitError) {
-				// Rate limit error
-				const errorMessage =
-					errorObj &&
-					"message" in errorObj &&
-					typeof errorObj.message === "string"
-						? errorObj.message
-						: null;
-				agentError = {
-					id: crypto.randomUUID(),
-					category: "rate_limit",
-					severity: "error",
-					title: "Rate Limit Exceeded",
-					message: errorMessage
-						? `Rate limit exceeded: ${errorMessage}`
-						: "Rate limit exceeded. Too many requests. Please try again later.",
-					suggestion:
-						"You have exceeded the API rate limit. Please wait a few moments before trying again.",
-					occurredAt: new Date(),
-					agentId: this.currentConfig?.id,
-					originalError: error,
-				};
-			} else {
-				// Authentication error
-				agentError = {
-					id: crypto.randomUUID(),
-					category: "authentication",
-					severity: "error",
-					title: "Authentication Failed",
-					message: `Authentication failed: ${error instanceof Error ? error.message : String(error)}`,
-					suggestion:
-						"Please check your API key or authentication credentials in settings.",
-					occurredAt: new Date(),
-					agentId: this.currentConfig?.id,
-					originalError: error,
-				};
-			}
-
-			this.errorCallback?.(agentError);
 			return false;
 		}
 	}
@@ -650,20 +609,6 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 				}
 			}
 
-			const agentError: AgentError = {
-				id: crypto.randomUUID(),
-				category: "communication",
-				severity: "error",
-				title: "Message Send Failed",
-				message: `Failed to send message: ${error instanceof Error ? error.message : String(error)}`,
-				suggestion: "Please check your connection and try again.",
-				occurredAt: new Date(),
-				agentId: this.currentConfig?.id,
-				sessionId: sessionId,
-				originalError: error,
-			};
-
-			this.errorCallback?.(agentError);
 			throw error;
 		}
 	}
@@ -756,24 +701,92 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 	}
 
 	/**
-	 * Register a callback to receive chat messages from the agent.
+	 * Set the session mode.
+	 *
+	 * Changes the agent's operating mode for the current session.
+	 * The agent will confirm the mode change via a current_mode_update notification.
+	 *
+	 * Implementation of IAgentClient.setSessionMode()
 	 */
-	onMessage(callback: (message: ChatMessage) => void): void {
-		this.messageCallback = callback;
+	async setSessionMode(sessionId: string, modeId: string): Promise<void> {
+		if (!this.connection) {
+			throw new Error(
+				"Connection not initialized. Call initialize() first.",
+			);
+		}
+
+		this.logger.log(
+			`[AcpAdapter] Setting session mode to: ${modeId} for session: ${sessionId}`,
+		);
+
+		try {
+			await this.connection.setSessionMode({
+				sessionId,
+				modeId,
+			});
+			this.logger.log(`[AcpAdapter] Session mode set to: ${modeId}`);
+		} catch (error) {
+			this.logger.error(
+				"[AcpAdapter] Failed to set session mode:",
+				error,
+			);
+			throw error;
+		}
 	}
 
 	/**
-	 * Register a callback to receive error notifications.
+	 * Implementation of IAgentClient.setSessionModel()
+	 */
+	async setSessionModel(sessionId: string, modelId: string): Promise<void> {
+		if (!this.connection) {
+			throw new Error(
+				"Connection not initialized. Call initialize() first.",
+			);
+		}
+
+		this.logger.log(
+			`[AcpAdapter] Setting session model to: ${modelId} for session: ${sessionId}`,
+		);
+
+		try {
+			await this.connection.setSessionModel({
+				sessionId,
+				modelId,
+			});
+			this.logger.log(`[AcpAdapter] Session model set to: ${modelId}`);
+		} catch (error) {
+			this.logger.error(
+				"[AcpAdapter] Failed to set session model:",
+				error,
+			);
+			throw error;
+		}
+	}
+
+	/**
+	 * Register a callback to receive session updates from the agent.
+	 *
+	 * This unified callback receives all session update events:
+	 * - agent_message_chunk: Text chunk from agent's response
+	 * - agent_thought_chunk: Text chunk from agent's reasoning
+	 * - tool_call: New tool call event
+	 * - tool_call_update: Update to existing tool call
+	 * - plan: Agent's task plan
+	 * - available_commands_update: Slash commands changed
+	 * - current_mode_update: Mode changed
+	 */
+	onSessionUpdate(callback: (update: SessionUpdate) => void): void {
+		this.sessionUpdateCallback = callback;
+	}
+
+	/**
+	 * Register callback for error notifications.
+	 *
+	 * Called when errors occur during agent operations that cannot be
+	 * propagated via exceptions (e.g., process spawn errors, exit code 127).
 	 */
 	onError(callback: (error: AgentError) => void): void {
 		this.errorCallback = callback;
-	}
-
-	/**
-	 * Register a callback to receive permission requests from the agent.
-	 */
-	onPermissionRequest(callback: (request: PermissionRequest) => void): void {
-		this.permissionCallback = callback;
 	}
 
 	/**
@@ -850,8 +863,8 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 		switch (update.sessionUpdate) {
 			case "agent_message_chunk":
 				if (update.content.type === "text") {
-					this.updateLastMessage({
-						type: "text",
+					this.sessionUpdateCallback?.({
+						type: "agent_message_chunk",
 						text: update.content.text,
 					});
 				}
@@ -859,67 +872,29 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 
 			case "agent_thought_chunk":
 				if (update.content.type === "text") {
-					this.updateLastMessage({
-						type: "agent_thought",
+					this.sessionUpdateCallback?.({
+						type: "agent_thought_chunk",
 						text: update.content.text,
 					});
 				}
 				break;
 
-			case "tool_call": {
-				// Try to update existing tool call first
-				const updated = this.updateMessage(update.toolCallId, {
-					type: "tool_call",
+			case "tool_call":
+			case "tool_call_update": {
+				this.sessionUpdateCallback?.({
+					type: update.sessionUpdate,
 					toolCallId: update.toolCallId,
-					title: update.title,
+					title: update.title ?? undefined,
 					status: update.status || "pending",
-					kind: update.kind,
+					kind: update.kind ?? undefined,
 					content: AcpTypeConverter.toToolCallContent(update.content),
 					locations: update.locations ?? undefined,
 				});
-
-				// Create new message only if no existing tool call was found
-				if (!updated) {
-					this.addMessage({
-						id: crypto.randomUUID(),
-						role: "assistant",
-						content: [
-							{
-								type: "tool_call",
-								toolCallId: update.toolCallId,
-								title: update.title,
-								status: update.status || "pending",
-								kind: update.kind,
-								content: AcpTypeConverter.toToolCallContent(
-									update.content,
-								),
-								locations: update.locations ?? undefined,
-							},
-						],
-						timestamp: new Date(),
-					});
-				}
 				break;
 			}
 
-			case "tool_call_update":
-				this.logger.log(
-					`[AcpAdapter] tool_call_update for ${update.toolCallId}, content:`,
-					update.content,
-				);
-				this.updateMessage(update.toolCallId, {
-					type: "tool_call",
-					toolCallId: update.toolCallId,
-					title: update.title,
-					status: update.status || "pending",
-					kind: update.kind || undefined,
-					content: AcpTypeConverter.toToolCallContent(update.content),
-					locations: update.locations ?? undefined,
-				});
-				break;
-
 			case "plan":
-				this.updateLastMessage({
+				this.sessionUpdateCallback?.({
 					type: "plan",
 					entries: update.entries,
 				});
@@ -939,9 +914,22 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 					hint: cmd.input?.hint ?? null,
 				}));
 
-				if (this.updateAvailableCommandsCallback) {
-					this.updateAvailableCommandsCallback(commands);
-				}
+				this.sessionUpdateCallback?.({
+					type: "available_commands_update",
+					commands,
+				});
+				break;
+			}
+
+			case "current_mode_update": {
+				this.logger.log(
+					`[AcpAdapter] current_mode_update: ${update.currentModeId}`,
+				);
+
+				this.sessionUpdateCallback?.({
+					type: "current_mode_update",
+					currentModeId: update.currentModeId,
+				});
 				break;
 			}
 		}
@@ -1095,39 +1083,20 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 			options: normalizedOptions,
 		});
 
-		// Try to update existing tool_call with permission request
-		const updated = this.updateMessage(toolCallId, {
+		// Emit tool_call with permission request via session update callback
+		// If tool_call exists, it will be updated; otherwise, a new one will be created
+		const toolCallInfo = params.toolCall;
+		this.sessionUpdateCallback?.({
 			type: "tool_call",
 			toolCallId: toolCallId,
+			title: toolCallInfo?.title ?? undefined,
+			status: toolCallInfo?.status || "pending",
+			kind: (toolCallInfo?.kind as acp.ToolKind | undefined) ?? undefined,
+			content: AcpTypeConverter.toToolCallContent(
+				toolCallInfo?.content as acp.ToolCallContent[] | undefined,
+			),
 			permissionRequest: permissionRequestData,
-		} as MessageContent);
-
-		// If no existing tool_call was found, create a new tool_call message with permission
-		if (!updated && params.toolCall?.title) {
-			const toolCallInfo = params.toolCall;
-			const status = toolCallInfo.status || "pending";
-			const kind = toolCallInfo.kind as acp.ToolKind | undefined;
-			const content = AcpTypeConverter.toToolCallContent(
-				toolCallInfo.content as acp.ToolCallContent[] | undefined,
-			);
-
-			this.addMessage({
-				id: crypto.randomUUID(),
-				role: "assistant",
-				content: [
-					{
-						type: "tool_call",
-						toolCallId: toolCallInfo.toolCallId,
-						title: toolCallInfo.title,
-						status,
-						kind,
-						content,
-						permissionRequest: permissionRequestData,
-					},
-				],
-				timestamp: new Date(),
-			});
-		}
+		});
 
 		// Return a Promise that will be resolved when user clicks a button
 		return new Promise((resolve) => {
@@ -1224,7 +1193,7 @@ export class AcpAdapter implements IAgentClient, IAcpClient {
 
 	killTerminal(
 		params: acp.KillTerminalCommandRequest,
-	): Promise<acp.KillTerminalResponse> {
+	): Promise<acp.KillTerminalCommandResponse> {
 		const success = this.terminalManager.killTerminal(params.terminalId);
 		if (!success) {
 			throw new Error(`Terminal ${params.terminalId} not found`);

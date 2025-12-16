@@ -3,6 +3,7 @@ import type {
 	ChatMessage,
 	MessageContent,
 } from "../domain/models/chat-message";
+import type { SessionUpdate } from "../domain/models/session-update";
 import type { IAgentClient } from "../domain/ports/agent-client.port";
 import type { IVaultAccess } from "../domain/ports/vault-access.port";
 import type { NoteMetadata } from "../domain/ports/vault-access.port";
@@ -15,6 +16,9 @@ import { Platform } from "obsidian";
 // ============================================================================
 // Types
 // ============================================================================
+
+/** Tool call content type extracted for type safety */
+type ToolCallMessageContent = Extract<MessageContent, { type: "tool_call" }>;
 
 /**
  * Options for sending a message.
@@ -76,9 +80,23 @@ export interface UseChatReturn {
 	/**
 	 * Callback to update a specific message by tool call ID.
 	 * Used by AcpAdapter for tool call status updates.
-	 * @returns True if the message was found and updated
 	 */
-	updateMessage: (toolCallId: string, content: MessageContent) => boolean;
+	updateMessage: (toolCallId: string, content: MessageContent) => void;
+
+	/**
+	 * Callback to upsert a tool call message.
+	 * If a tool call with the given ID exists, it will be updated.
+	 * Otherwise, a new message will be created.
+	 * Used by AcpAdapter for tool_call and tool_call_update events.
+	 */
+	upsertToolCall: (toolCallId: string, content: MessageContent) => void;
+
+	/**
+	 * Handle a session update from the agent.
+	 * This is the unified handler for all session update events.
+	 * Should be registered with agentClient.onSessionUpdate().
+	 */
+	handleSessionUpdate: (update: SessionUpdate) => void;
 }
 
 /**
@@ -94,6 +112,52 @@ export interface SessionContext {
  */
 export interface SettingsContext {
 	windowsWslMode: boolean;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Merge new tool call content into existing tool call.
+ * Preserves existing values when new values are undefined.
+ */
+function mergeToolCallContent(
+	existing: ToolCallMessageContent,
+	update: ToolCallMessageContent,
+): ToolCallMessageContent {
+	// Merge content arrays
+	let mergedContent = existing.content || [];
+	if (update.content !== undefined) {
+		const newContent = update.content || [];
+
+		// If new content contains diff, replace all old diffs
+		const hasDiff = newContent.some((item) => item.type === "diff");
+		if (hasDiff) {
+			mergedContent = mergedContent.filter(
+				(item) => item.type !== "diff",
+			);
+		}
+
+		mergedContent = [...mergedContent, ...newContent];
+	}
+
+	return {
+		...existing,
+		toolCallId: update.toolCallId,
+		title: update.title !== undefined ? update.title : existing.title,
+		kind: update.kind !== undefined ? update.kind : existing.kind,
+		status: update.status !== undefined ? update.status : existing.status,
+		content: mergedContent,
+		locations:
+			update.locations !== undefined
+				? update.locations
+				: existing.locations,
+		permissionRequest:
+			update.permissionRequest !== undefined
+				? update.permissionRequest
+				: existing.permissionRequest,
+	};
 }
 
 // ============================================================================
@@ -205,74 +269,130 @@ export function useChat(
 
 	/**
 	 * Update a specific message by tool call ID.
+	 * Only updates if the tool call exists in state.
 	 */
 	const updateMessage = useCallback(
-		(toolCallId: string, content: MessageContent): boolean => {
-			let found = false;
+		(toolCallId: string, content: MessageContent): void => {
+			if (content.type !== "tool_call") return;
 
-			setMessages((prev) => {
-				const updatedMessages = prev.map((message) => ({
+			setMessages((prev) =>
+				prev.map((message) => ({
 					...message,
 					content: message.content.map((c) => {
 						if (
 							c.type === "tool_call" &&
-							c.toolCallId === toolCallId &&
-							content.type === "tool_call"
+							c.toolCallId === toolCallId
+						) {
+							return mergeToolCallContent(c, content);
+						}
+						return c;
+					}),
+				})),
+			);
+		},
+		[],
+	);
+
+	/**
+	 * Upsert a tool call message.
+	 * If a tool call with the given ID exists, it will be updated (merged).
+	 * Otherwise, a new assistant message will be created.
+	 * All logic is inside setMessages callback to avoid race conditions.
+	 */
+	const upsertToolCall = useCallback(
+		(toolCallId: string, content: MessageContent): void => {
+			if (content.type !== "tool_call") return;
+
+			setMessages((prev) => {
+				// Try to find existing tool call
+				let found = false;
+				const updated = prev.map((message) => ({
+					...message,
+					content: message.content.map((c) => {
+						if (
+							c.type === "tool_call" &&
+							c.toolCallId === toolCallId
 						) {
 							found = true;
-							// Merge content arrays
-							let mergedContent = c.content || [];
-							if (content.content !== undefined) {
-								const newContent = content.content || [];
-
-								// If new content contains diff, replace all old diffs
-								const hasDiff = newContent.some(
-									(item) => item.type === "diff",
-								);
-								if (hasDiff) {
-									mergedContent = mergedContent.filter(
-										(item) => item.type !== "diff",
-									);
-								}
-
-								mergedContent = [
-									...mergedContent,
-									...newContent,
-								];
-							}
-
-							return {
-								...c,
-								toolCallId: content.toolCallId,
-								title:
-									content.title !== undefined
-										? content.title
-										: c.title,
-								kind:
-									content.kind !== undefined
-										? content.kind
-										: c.kind,
-								status:
-									content.status !== undefined
-										? content.status
-										: c.status,
-								content: mergedContent,
-								permissionRequest:
-									content.permissionRequest !== undefined
-										? content.permissionRequest
-										: c.permissionRequest,
-							};
+							return mergeToolCallContent(c, content);
 						}
 						return c;
 					}),
 				}));
 
-				return found ? updatedMessages : prev;
-			});
+				if (found) {
+					return updated;
+				}
 
-			return found;
+				// Not found - create new message
+				return [
+					...prev,
+					{
+						id: crypto.randomUUID(),
+						role: "assistant" as const,
+						content: [content],
+						timestamp: new Date(),
+					},
+				];
+			});
 		},
 		[],
+	);
+
+	/**
+	 * Handle a session update from the agent.
+	 * This is the unified handler for all session update events.
+	 *
+	 * Note: available_commands_update and current_mode_update are not handled here
+	 * as they are session-level updates, not message-level updates.
+	 * They should be handled by useAgentSession.
+	 */
+	const handleSessionUpdate = useCallback(
+		(update: SessionUpdate): void => {
+			switch (update.type) {
+				case "agent_message_chunk":
+					updateLastMessage({
+						type: "text",
+						text: update.text,
+					});
+					break;
+
+				case "agent_thought_chunk":
+					updateLastMessage({
+						type: "agent_thought",
+						text: update.text,
+					});
+					break;
+
+				case "tool_call":
+				case "tool_call_update":
+					upsertToolCall(update.toolCallId, {
+						type: "tool_call",
+						toolCallId: update.toolCallId,
+						title: update.title,
+						status: update.status || "pending",
+						kind: update.kind,
+						content: update.content,
+						locations: update.locations,
+						permissionRequest: update.permissionRequest,
+					});
+					break;
+
+				case "plan":
+					updateLastMessage({
+						type: "plan",
+						entries: update.entries,
+					});
+					break;
+
+				// Session-level updates are handled elsewhere (useAgentSession)
+				case "available_commands_update":
+				case "current_mode_update":
+					// These are intentionally not handled here
+					break;
+			}
+		},
+		[updateLastMessage, upsertToolCall],
 	);
 
 	/**
@@ -415,5 +535,7 @@ export function useChat(
 		addMessage,
 		updateLastMessage,
 		updateMessage,
+		upsertToolCall,
+		handleSessionUpdate,
 	};
 }
